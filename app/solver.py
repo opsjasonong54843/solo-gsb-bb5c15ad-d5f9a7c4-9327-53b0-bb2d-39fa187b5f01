@@ -64,9 +64,12 @@ _derive_bound 求 t(乙) − t(甲) 的最紧下界/上界（推不出的端点�
 行程可达性核对（check_itinerary）：区间文本沿用现有时间差区间（可留空），另有逐行
 “事件,地点”、有向路段“起点,终点,分钟”（非负分钟，重复有向路段取最短）与按发生顺序
 排列的事件名（每行一个、互不相同）。先对四类文本逐行校验（重复事件地点、缺失事件
-地点、重复行程事件、负通行时间等），再对每对相邻行程事件在地点网络上用 Dijkstra 求
-最短通行时间（边权非负；同地点按零分钟）；等距离路线按节点序列字典序与路段行号决胜，
-保证结果确定。无路可达的相邻事件段逐段指出且不联立；可达时把每个
+地点、重复行程事件、负通行时间等）；有向路网在单次请求内只构建一次（RouteNetwork），
+再对每对相邻行程事件求最短通行：Dijkstra 以出发地点为粒度缓存单源结果，长行程多次
+从同一地点出发时只扫描一次图，其余事件段直接复用并按定稿节点序列还原各自的原始
+路段行号与路线（边权非负；同地点按零分钟）；等距离路线按节点序列字典序与路段行号
+决胜，保证结果确定，且缓存只在本次请求内有效、输入变化后绝不沿用旧路线。无路可达
+的相邻事件段逐段指出且不联立；可达时把每个
 “后一事件 − 前一事件 ≥ 最短通行分钟”作为通行下界边（b -> a，权 -d）与原区间一起
 跑同一套 Bellman-Ford：负环还原的闭合矛盾链同时含原始区间行号与通行下界环节
 （标注事件段序号、地点对及最短路线）；可行时平移到最早事件为第 0 分钟，给出一条满足
@@ -1763,84 +1766,93 @@ def parse_itinerary(text: str) -> tuple[list[str], list[dict]]:
     return events, errors
 
 
-def _route_between(
-    routes: list[RouteRow], src: str, dst: str
-) -> tuple[int | None, list[dict]]:
-    """求地点网络中 src -> dst 的最短通行时间与逐路段路线。
+class RouteNetwork:
+    """本次行程核对请求内复用的有向地点路网。
 
-    边权均为非负分钟，使用 Dijkstra；同一起终点的多条有向路段全部保留，
-    最短路自动取最小值。等距离的多条路线按“路径节点序列字典序”决胜，
-    保证同一份输入得到确定且可复核的最短路线。
+    邻接表只在构造时构建一次；单次最短路以“出发地点”为粒度缓存——长行程中多次
+    从同一地点出发时，只对该源跑一次 Dijkstra（定稿到全部可达终点的结果），之后
+    同出发地点的各事件段直接复用。缓存保存在实例上、随请求结束而丢弃，不跨请求
+    共享：下一次请求的路段文本若有变化会构造出新的路网，绝不沿用旧路线。
 
-    返回 (最短分钟, 路段列表)，无路可达时分钟为 None、路段列表为空。
-    每段含路段原始行号、起点、终点与该段分钟。
+    边权均为非负分钟；同一起终点的多条有向路段全部保留，最短路自动取最小值。
+    等距离的多条路线按“路径节点序列字典序”决胜，保证同一份输入得到确定且
+    可复核的最短路线；节点序列相同的平行边在还原阶段再按路段行号取最小。
     """
-    if src == dst:
-        # 同地点按零分钟处理，不经过任何路段
-        return 0, []
 
-    adj: dict[str, list[tuple[str, int, int]]] = {}
-    for r in routes:
-        adj.setdefault(r.src, []).append((r.dst, r.minutes, r.line))
+    def __init__(self, routes: list[RouteRow]):
+        # 同一有向路网只构建一次：邻接项为 (终点, 分钟, 原始行号)
+        self._adj: dict[str, list[tuple[str, int, int]]] = {}
+        for r in routes:
+            self._adj.setdefault(r.src, []).append((r.dst, r.minutes, r.line))
 
-    # 按“(最短距离, 节点序列字典序)”决胜的 Dijkstra。
-    # 普通 Dijkstra 只对每个顶点维护一个距离；为在等距离路线中选节点序列字典序最小者，
-    # 堆项携带完整路径 (累计分钟, 路径序列)，并对每个顶点单独维护当前最佳的
-    # (距离, 路径)：只有候选严格更优（更短，或等距且序列字典序更小）才入堆。
-    # 决胜只看节点名序列（节点序列相同的平行边在还原阶段再按行号取最小），
-    # 不保证“直达优先”——同距离时第二节点名字典序更小的路线胜出。
-    # 边权非负，顶点第一次被 pop 即为其定稿最优路线。
-    heap: list[tuple[int, tuple[str, ...]]] = [(0, (src,))]
-    # 每个顶点当前最佳的 (距离, 路径)；邻接边只从仍是该顶点最佳的路径展开，
-    # 被更优路线取代的旧路径不再扩展（其下游不可能凭旧前缀变得更优）。
-    best: dict[str, tuple[int, tuple[str, ...]]] = {src: (0, (src,))}
-    done: set[str] = set()
-    while heap:
-        d, path = heapq.heappop(heap)
-        u = path[-1]
-        if u in done:
-            continue
-        if best.get(u) != (d, path):
-            continue  # 已被更优（同距离字典序更小）路线取代的过期堆项
-        done.add(u)
-        if u == dst:
-            break
-        # 邻接边按 (终点名, 分钟, 行号) 排序，使路径字典序比较有稳定依据
-        for v, w, _line in sorted(adj.get(u, ()), key=lambda e: (e[0], e[1], e[2])):
-            cand = d + w
-            cand_path = path + (v,)
-            cand_key = (cand, cand_path)
-            old = best.get(v)
-            if old is None or cand < old[0] or (cand == old[0] and cand_path < old[1]):
-                best[v] = cand_key
-                heapq.heappush(heap, cand_key)
+        # 每个出发地点至多跑一次单源 Dijkstra，结果在本请求内复用：
+        # 源 -> {终点: (最短分钟, 定稿节点序列)}；不可达终点不在字典中
+        self._solutions: dict[str, dict[str, tuple[int, tuple[str, ...]]]] = {}
 
-    if dst not in done:
-        return None, []
+    def shortest(self, src: str, dst: str) -> tuple[int | None, list[dict]]:
+        """求 src -> dst 的最短通行时间与逐路段路线。
 
-    # 沿定稿路径逐点对反查路段：该段分钟 = 相邻定稿点最佳距离之差；
-    # 多行平行边中选分钟等于该差值且行号最小的一条。
-    final_path = best[dst][1]
-    segs: list[dict] = []
-    for u, v in zip(final_path, final_path[1:]):
-        w = best[v][0] - best[u][0]
-        line = min(line for (vv, ww, line) in adj[u] if vv == v and ww == w)
-        segs.append({"line": line, "from": u, "to": v, "minutes": w})
-    return best[dst][0], segs
+        返回 (最短分钟, 路段列表)，无路可达时分钟为 None、路段列表为空。
+        每段含路段原始行号、起点、终点与该段分钟；同地点按零分钟、不经过任何路段。
+        """
+        if src == dst:
+            # 同地点按零分钟处理，不经过任何路段
+            return 0, []
 
-    if dst not in done:
-        return None, []
+        solution = self._solutions.get(src)
+        if solution is None:
+            solution = self._solve_from(src)
+            self._solutions[src] = solution
 
-    # 沿定稿路径逐点对反查路段：该段最短分钟 = 相邻定稿点的最短距离增量；
-    # 多行平行边中选分钟等于该增量且行号最小的一条（与 Dijkstra 选中的边一致）。
-    segs: list[dict] = []
-    for u, v in zip(best_path[dst], best_path[dst][1:]):
-        w = dist[v] - dist[u]
-        matching = sorted(
-            (line for (vv, ww, line) in adj[u] if vv == v and ww == w)
-        )
-        segs.append({"line": matching[0], "from": u, "to": v, "minutes": w})
-    return dist[dst], segs
+        final = solution.get(dst)
+        if final is None:
+            return None, []
+
+        # 沿定稿路径逐点对还原原始路段：该段分钟 = 相邻定稿点最佳距离之差；
+        # 多行平行边中选分钟等于该增量且行号最小的一条（与 Dijkstra 选中的边一致）。
+        final_path = final[1]
+        segs: list[dict] = []
+        for u, v in zip(final_path, final_path[1:]):
+            w = solution[v][0] - solution[u][0]
+            line = min(line for (vv, ww, line) in self._adj[u] if vv == v and ww == w)
+            segs.append({"line": line, "from": u, "to": v, "minutes": w})
+        return final[0], segs
+
+    def _solve_from(self, src: str) -> dict[str, tuple[int, tuple[str, ...]]]:
+        """以 src 为源跑一次到全部可达终点的 Dijkstra，返回 {终点: (距离, 定稿路径)}。
+
+        按“(最短距离, 节点序列字典序)”决胜：普通 Dijkstra 只对每个顶点维护一个距离；
+        为在等距离路线中选节点序列字典序最小者，堆项携带完整路径 (累计分钟, 路径序列)，
+        并对每个顶点单独维护当前最佳的 (距离, 路径)：只有候选严格更优（更短，或等距且
+        序列字典序更小）才入堆。决胜只看节点名序列（节点序列相同的平行边在还原阶段再按
+        行号取最小），不保证“直达优先”——同距离时第二节点名字典序更小的路线胜出。
+        边权非负，顶点第一次被 pop 即为其定稿最优路线；一次扫描定稿 src 到全部可达
+        终点的结果，供同一出发地点的多个事件段复用。
+        """
+        heap: list[tuple[int, tuple[str, ...]]] = [(0, (src,))]
+        # 每个顶点当前最佳的 (距离, 路径)；邻接边只从仍是该顶点最佳的路径展开，
+        # 被更优路线取代的旧路径不再扩展（其下游不可能凭旧前缀变得更优）。
+        best: dict[str, tuple[int, tuple[str, ...]]] = {src: (0, (src,))}
+        done: set[str] = set()
+        while heap:
+            d, path = heapq.heappop(heap)
+            u = path[-1]
+            if u in done:
+                continue
+            if best.get(u) != (d, path):
+                continue  # 已被更优（同距离字典序更小）路线取代的过期堆项
+            done.add(u)
+            # 邻接边按 (终点名, 分钟, 行号) 排序，使路径字典序比较有稳定依据
+            for v, w, _line in sorted(self._adj.get(u, ()), key=lambda e: (e[0], e[1], e[2])):
+                cand = d + w
+                cand_path = path + (v,)
+                cand_key = (cand, cand_path)
+                old = best.get(v)
+                if old is None or cand < old[0] or (cand == old[0] and cand_path < old[1]):
+                    best[v] = cand_key
+                    heapq.heappush(heap, cand_key)
+
+        return {u: best[u] for u in done}
 
 
 def _travel_step(names: list[str], e: Edge) -> dict:
@@ -1929,19 +1941,21 @@ def check_itinerary(text: str, places_text: str, routes_text: str, itinerary_tex
             result["missing_places"] = missing
         return result
 
-    # 3) 逐相邻事件求地点网络最短通行；同地点零分钟，无路可达单独记录
+    # 3) 逐相邻事件求地点网络最短通行；同地点零分钟，无路可达单独记录。
+    # 有向路网在本次请求内只构建一次，按出发地点复用单源最短路结果：长行程多次
+    # 从同一地点出发时不再重复扫描整张图；实例为本次请求局部变量，请求结束即失效。
+    network = RouteNetwork(routes)
     segments: list[dict] = []
     unreachable: list[dict] = []
     for i in range(len(itinerary) - 1):
         a, b = itinerary[i], itinerary[i + 1]
         pa, pb = place_of[a], place_of[b]
         idx = i + 1
-        if pa == pb:
+        same_place = pa == pb
+        if same_place:
             shortest, route = 0, []
-            same_place = True
         else:
-            shortest, route = _route_between(routes, pa, pb)
-            same_place = False
+            shortest, route = network.shortest(pa, pb)
         seg = {
             "index": idx,
             "from_event": a,
